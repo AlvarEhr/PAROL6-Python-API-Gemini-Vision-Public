@@ -12,6 +12,7 @@ import asyncio
 import json
 import time
 import traceback
+import warnings
 from enum import Enum
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
@@ -66,20 +67,30 @@ class OperationMode(Enum):
 class GeminiConfig:
     """Configuration for Gemini Live API"""
     mode: OperationMode
-    model: str = "gemini-2.5-flash-live-preview"
+    model: str = "gemini-2.5-flash-live-preview"  # Default for text responses
     enable_compositional: bool = False
     turn_coverage: str = "TURN_INCLUDES_ONLY_ACTIVITY"
     snapshot_interval: float = 1.0
     livestream_fps: int = 10
-    enable_voice: bool = False
+    enable_voice: bool = False  # Whether to use voice RESPONSES (TTS)
     enable_debug: bool = True
-    input_mode: str = "text"  # "text" or "audio"
+    input_mode: str = "text"  # "text" or "audio" INPUT
     push_to_talk_key: str = "space"  # Key to hold for voice input
+    response_mode: str = "text"  # "text" or "audio" RESPONSE
     
     @classmethod
-    def from_mode(cls, mode_name: str, input_mode: str = "text"):
-        """Create config based on mode"""
+    def from_mode(cls, mode_name: str, input_mode: str = "text", response_mode: str = "text"):
+        """Create config based on mode
+        
+        Args:
+            mode_name: "text" or "autonomous"
+            input_mode: "text" or "audio" for input
+            response_mode: "text" or "audio" for responses
+        """
         mode = OperationMode(mode_name.lower())
+        
+        # Determine if we should enable voice based on response mode
+        enable_voice_output = (response_mode == "audio")
         
         configs = {
             OperationMode.TEXT: cls(
@@ -88,9 +99,10 @@ class GeminiConfig:
                 turn_coverage="TURN_INCLUDES_ONLY_ACTIVITY",
                 snapshot_interval=1.0,
                 livestream_fps=3,
-                enable_voice=False,
+                enable_voice=enable_voice_output,
                 enable_debug=True,
-                input_mode=input_mode
+                input_mode=input_mode,
+                response_mode=response_mode
             ),
             OperationMode.AUTONOMOUS: cls(
                 mode=mode,
@@ -98,9 +110,10 @@ class GeminiConfig:
                 turn_coverage="TURN_INCLUDES_ALL_INPUT",
                 snapshot_interval=0.5,
                 livestream_fps=5,
-                enable_voice=(input_mode == "audio"),  # Enable voice if using audio input
-                enable_debug=False,
-                input_mode=input_mode
+                enable_voice=enable_voice_output,
+                enable_debug=True,  # Keep debug for now
+                input_mode=input_mode,
+                response_mode=response_mode
             )
         }
         
@@ -140,10 +153,14 @@ class GeminiLiveSession:
 
         # Add audio-related attributes
         self.audio_queue = queue.Queue()
+        self.audio_output_queue = None  # Will be asyncio.Queue() when session starts
         self.pya = None
         self.audio_stream = None
+        self.audio_output_stream = None  # For audio playback
         self._recording = False
         self._audio_task = None
+        self._audio_playback_task = None
+        self._audio_frame_for_context = None  # Store frame to send with audio
         
         # For autonomous mode
         self._autonomous_active = False
@@ -212,13 +229,20 @@ class GeminiLiveSession:
                 return control_electric_gripper(action=action, **kwargs)
         return gripper_control
     
-    async def search_for_object_wrapper(self, object_description: str, pattern: str = "sweep"):
+    async def search_for_object_wrapper(self, object_description: str, pattern: str = "sweep", position: str = "low"):
         """Wrapper that tracks search target"""
         self._current_search_target = object_description
         self._search_message_sent = False
         if self.config.enable_debug:
             print(f"[DEBUG] Starting search for: {object_description}")
-        return await self.robot_tools.search_for_object(object_description, pattern)
+        
+        # Execute the search (starts movement and returns immediately)
+        result = await self.robot_tools.search_for_object(object_description, pattern, position)
+        
+        # The search is now running in the background
+        # Movement will continue until stop_when_found() is called or search completes
+        
+        return result
         
     async def stop_when_found_wrapper(self):
         """Wrapper that clears search target"""
@@ -270,6 +294,14 @@ SAFETY RULES:
 - Always stop movement if something seems to be wrong
 - Stop immediately if any error detected
 
+IF YOU ARE ASKED TO PICK SOMETHING UP OR PLACE IT AND YOU CANNOT SEE IT, DO NOT ASK FOR CLARIFICATION, SIMPLY USE THE search_for_object FUNCTION TO FIND IT.
+
+IF YOU ARE ASKED TO PICK UP AND PLACE SOMETHING SOMETHING BUT HAVE NOT YET PICKED UP AN OBJECT, FIRST PICK IT UP THEN FIND THE AREA TO PLACE IT.
+
+AGAIN, IF YOU HAVE NOT YET PICKED UP AND OBJECT AND CANNOT SEE ITS DESTINATION, FIRST SEARCH FOR THE OBJECT TO PICK UP, 
+PICK IT UP AND ONLY SHOULD YOU BEGIN THE SEARCH FOR THE PLACEMENT AREA, ALL WITHOUT ASKING THE USE, 
+REMEMBER TO USE THE search_for_object FUNCTION FOR THE PLACEMENT AREA TOO.
+
 Execute complete sequences autonomously. Report only essential info."""
         
         else:  # TEXT mode
@@ -297,7 +329,6 @@ CRITICAL RULES:
 - For any action, use the appropriate tool function
 - If you cannot find an appropriate tool, say so
 
-In TEXT mode, execute one function at a time and wait for user input between steps.
 Report results clearly and wait for next instruction."""
     
     def initialize_components(self):
@@ -374,9 +405,17 @@ Report results clearly and wait for next instruction."""
         # Available tools initialization
         tools = [{"function_declarations": robot_tools}]
         
+        # NOTE: Gemini Live API only supports one response modality at a time
+        # In audio mode, responses will be audio-only (no text feedback in terminal)
+        # Determine the response modality based on configuration
+        if self.config.enable_voice:
+            response_modality = [types.Modality.AUDIO]  # Audio-only mode
+        else:
+            response_modality = [types.Modality.TEXT]   # Text-only mode
+        
         # Build session config
         config = types.LiveConnectConfig(
-            response_modalities=["TEXT"],
+            response_modalities=response_modality,  # Use the determined modality
             system_instruction=self._build_system_instruction(),
             tools=tools,
             media_resolution="MEDIA_RESOLUTION_MEDIUM"
@@ -387,20 +426,29 @@ Report results clearly and wait for next instruction."""
             config.realtime_input_config = types.RealtimeInputConfig(
                 turn_coverage=self.config.turn_coverage
             )
+        elif self.config.input_mode == "audio":
+            # For audio mode, use TURN_INCLUDES_ALL_INPUT like Google's example
+            # This ensures all audio input is considered part of the turn
+            config.realtime_input_config = types.RealtimeInputConfig(
+                turn_coverage="TURN_INCLUDES_ALL_INPUT"
+            )
         
-        # Add voice if enabled
+        # Add speech config if using audio modality
         if self.config.enable_voice:
-            config.response_modalities.append("AUDIO")
             config.speech_config = types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name="Puck"
+                        voice_name="Charon"
                     )
                 )
             )
         
         print(f"[CONNECT] Establishing connection...")
         print(f"Mode: {self.config.mode.value}")
+        print(f"Input: {self.config.input_mode}")
+        print(f"Response: {self.config.response_mode}")
+        if self.config.enable_voice:
+            print(f"Note: Audio responses enabled - you will hear Gemini speak")
         print(f"Compositional: {self.config.enable_compositional}")
         
         async with self.client.aio.live.connect(
@@ -412,9 +460,16 @@ Report results clearly and wait for next instruction."""
             self._reconnect_attempts = 0  # Reset on successful connection
             self._last_successful_response = time.time()
             
+            # Always initialize asyncio.Queue for audio output (prevents None checks)
+            self.audio_output_queue = asyncio.Queue()
+            
+            # Start audio tasks now that session is active
+            await self.start_audio_tasks()
+            
             print(f"[CONNECTED] Gemini Live session established")
             print(f"Model: {self.config.model}")
             print(f"Tools: {len(robot_tools)} registered")
+            print(f"Response Mode: {'Audio-only' if self.config.enable_voice else 'Text-only'}")
             
             # If we had a pending tool response, send it now
             if self._pending_tool_response:
@@ -433,12 +488,37 @@ Report results clearly and wait for next instruction."""
             # Monitor connection health
             monitor_task = asyncio.create_task(self._monitor_connection_health())
             
+            # Start audio player task if voice is enabled
+            audio_player_task = None
+            if self.config.enable_voice and self.audio_output_stream:
+                audio_player_task = asyncio.create_task(self._audio_player())
+                if self.config.enable_debug:
+                    print("[DEBUG] Audio player task started")
+            
+            # Collect tasks to monitor
+            tasks_to_monitor = [response_task, monitor_task]
+            if audio_player_task:
+                tasks_to_monitor.append(audio_player_task)
+            
             try:
                 # Wait for tasks
                 done, pending = await asyncio.wait(
-                    [response_task, monitor_task],
+                    tasks_to_monitor,
                     return_when=asyncio.FIRST_COMPLETED
                 )
+                
+                # Check if any completed task has an exception and re-raise it
+                for task in done:
+                    if task.exception() is not None:
+                        # Cancel remaining tasks first
+                        for pending_task in pending:
+                            pending_task.cancel()
+                            try:
+                                await pending_task
+                            except asyncio.CancelledError:
+                                pass
+                        # Now re-raise the exception to trigger reconnection
+                        raise task.exception()
                 
                 # Cancel remaining tasks
                 for task in pending:
@@ -474,6 +554,14 @@ Report results clearly and wait for next instruction."""
                         # Text response accumulation
                         if response.text and not self._waiting_for_input:
                             turn_text += response.text
+                        
+                        # Audio response handling - Google's example shows response.data directly
+                        if response.data:
+                            # Audio comes as raw PCM data in response.data - streaming chunks
+                            # Don't log every chunk as it floods the output
+                            # Queue audio for playback - MUST await for asyncio.Queue
+                            if self.audio_output_queue:
+                                await self.audio_output_queue.put(response.data)
                         
                         # Tool invocation processing
                         if response.tool_call:
@@ -558,6 +646,9 @@ Report results clearly and wait for next instruction."""
 
     async def _monitor_connection_health(self):
         """Monitor connection health and trigger reconnection if needed"""
+        consecutive_timeouts = 0
+        max_consecutive_timeouts = 3
+        
         while self._session_active:
             try:
                 await asyncio.sleep(5)  # 5-second health check interval
@@ -566,19 +657,34 @@ Report results clearly and wait for next instruction."""
                 time_since_last = time.time() - self._last_successful_response
                 
                 if time_since_last > self._connection_timeout:
-                    print(f"[WARNING] No responses for {time_since_last:.1f}s, connection may be dead")
+                    consecutive_timeouts += 1
+                    print(f"[WARNING] No responses for {time_since_last:.1f}s, connection may be dead (timeout {consecutive_timeouts}/{max_consecutive_timeouts})")
+                    
+                    # After multiple consecutive timeouts, force reconnection
+                    if consecutive_timeouts >= max_consecutive_timeouts:
+                        print(f"[ERROR] Connection appears dead after {consecutive_timeouts} consecutive timeouts")
+                        raise ConnectionError(f"Connection timeout - no responses for {time_since_last:.1f}s")
                     
                     # Try sending a simple status request to test connection
-                    try:
-                        if self.session:
-                            # Send a lightweight message to test connection
-                            await self.session.send_client_content(
-                                turns=[{'role': 'user', 'parts': [types.Part(text="")]}],
-                                turn_complete=True
-                            )
-                    except Exception as e:
-                        print(f"[ERROR] Connection test failed: {e}")
-                        raise ConnectionError("Connection health check failed")
+                    # Skip this for audio mode as it interferes with audio flow
+                    if self.config.input_mode != "audio":
+                        try:
+                            if self.session:
+                                # Send a lightweight message to test connection
+                                # Use send_client_content to avoid deprecation warning
+                                await self.session.send_client_content(
+                                    turns=[{
+                                        'role': 'user',
+                                        'parts': [types.Part(text=".")]
+                                    }],
+                                    turn_complete=True
+                                )
+                        except Exception as e:
+                            print(f"[ERROR] Connection test failed: {e}")
+                            raise ConnectionError("Connection health check failed")
+                else:
+                    # Reset counter if we're getting responses
+                    consecutive_timeouts = 0
                         
             except asyncio.CancelledError:
                 break
@@ -652,13 +758,19 @@ Report results clearly and wait for next instruction."""
             try:
                 # Handle async vs sync functions
                 if asyncio.iscoroutinefunction(function_to_call):
+                    # It's an async function, await it directly
                     result = await function_to_call(**arguments)
                 else:
+                    # It's a sync function - first try calling it normally
+                    # to check if it returns a coroutine
                     result = function_to_call(**arguments)
                     if asyncio.iscoroutine(result):
+                        # It returned a coroutine, await it
                         result = await result
-                    elif not asyncio.iscoroutinefunction(function_to_call):
-                        result = await asyncio.to_thread(function_to_call, **arguments)
+                    else:
+                        # It's a regular sync function that returned a value
+                        # We already have the result, no need to call again
+                        pass
                 
                 print(f"<- Result: {result}")
                 
@@ -750,7 +862,8 @@ Report results clearly and wait for next instruction."""
             image = PIL.Image.fromarray(cv2.cvtColor(color_frame, cv2.COLOR_BGR2RGB))
             
             # Check if we're searching and should send a reminder
-            if self._current_search_target:
+            # Only send reminders if we're actively moving and searching
+            if self._current_search_target and self._movement_active:
                 # Initialize frame counter if needed
                 if not hasattr(self, '_frames_since_reminder'):
                     self._frames_since_reminder = 0
@@ -847,34 +960,62 @@ Report results clearly and wait for next instruction."""
             return {"status": "disconnected", "message": str(e), "connected": False}
         
     async def setup_audio(self):
-        """Initialize audio components for push-to-talk"""
-        if self.config.input_mode != "audio":
+        """Initialize audio components for push-to-talk and/or audio playback"""
+        if self.config.input_mode != "audio" and not self.config.enable_voice:
             return
             
         try:
             self.pya = pyaudio.PyAudio()
-            mic_info = self.pya.get_default_input_device_info()
             
-            self.audio_stream = self.pya.open(
-                format=AUDIO_FORMAT,
-                channels=AUDIO_CHANNELS,
-                rate=AUDIO_RATE,
-                input=True,
-                input_device_index=mic_info["index"],
-                frames_per_buffer=AUDIO_CHUNK
-            )
+            # Setup input stream if using audio input
+            if self.config.input_mode == "audio":
+                mic_info = self.pya.get_default_input_device_info()
+                
+                self.audio_stream = self.pya.open(
+                    format=AUDIO_FORMAT,
+                    channels=AUDIO_CHANNELS,
+                    rate=AUDIO_RATE,
+                    input=True,
+                    input_device_index=mic_info["index"],
+                    frames_per_buffer=AUDIO_CHUNK
+                )
+                
+                print(f"Audio input initialized. Hold [{self.config.push_to_talk_key}] to speak")
+                
+                # NOTE: Audio sending task and keyboard listener will be started
+                # in start_audio_tasks() after the session is active
             
-            print(f"Audio input initialized. Hold [{self.config.push_to_talk_key}] to speak")
+            # Setup output stream if using voice responses
+            if self.config.enable_voice:
+                print(f"[DEBUG] Initializing audio output (enable_voice={self.config.enable_voice})")
+                self.audio_output_stream = self.pya.open(
+                    format=AUDIO_FORMAT,
+                    channels=AUDIO_CHANNELS,
+                    rate=24000,  # Gemini outputs at 24kHz
+                    output=True,
+                    frames_per_buffer=AUDIO_CHUNK
+                )
+                
+                print("[OK] Audio output initialized for voice responses")
+                
+                # Note: Audio playback task is started in run_session()
             
+        except Exception as e:
+            print(f"Failed to initialize audio: {e}")
+            if self.config.input_mode == "audio":
+                self.config.input_mode = "text"  # Fallback to text
+    
+    async def start_audio_tasks(self):
+        """Start audio tasks after session is active"""
+        if self.config.input_mode == "audio":
             # Start audio sending task
             self._audio_task = asyncio.create_task(self._audio_sender())
             
             # Setup keyboard listener in a thread
             threading.Thread(target=self._keyboard_listener, daemon=True).start()
             
-        except Exception as e:
-            print(f"Failed to initialize audio: {e}")
-            self.config.input_mode = "text"  # Fallback to text
+            if self.config.enable_debug:
+                print("[DEBUG] Audio tasks started")
     
     def _keyboard_listener(self):
         """Thread to listen for push-to-talk key"""
@@ -883,14 +1024,25 @@ Report results clearly and wait for next instruction."""
                 if keyboard.is_pressed(self.config.push_to_talk_key):
                     if not self._recording:
                         self._recording = True
+                        
+                        # Capture and immediately send current frame for visual context
+                        if self.vision_controller:
+                            color_frame, _ = self.vision_controller.get_frames()
+                            if color_frame is not None:
+                                self._audio_frame_for_context = color_frame.copy()
+                                # Queue the frame to be sent immediately when recording starts
+                                self.audio_queue.put({"send_frame": True})
+                                if self.config.enable_debug:
+                                    print("[DEBUG] Captured frame for audio context")
+                        
                         print("[Recording...]", end="\r")
                         threading.Thread(target=self._record_audio, daemon=True).start()
                 else:
                     if self._recording:
                         self._recording = False
-                        print("[Released]    ", end="\r")
-                        # Send end of turn signal
-                        self.audio_queue.put({"end_of_turn": True})
+                        print("[Processing...] ", end="\r")
+                        # Signal end of recording
+                        self.audio_queue.put({"end_of_recording": True})
                         
                 time.sleep(0.01)  # Small delay to prevent CPU spinning
                 
@@ -903,6 +1055,7 @@ Report results clearly and wait for next instruction."""
         while self._recording and self.audio_stream:
             try:
                 data = self.audio_stream.read(AUDIO_CHUNK, exception_on_overflow=False)
+                # Queue audio for real-time streaming (following Google's approach)
                 self.audio_queue.put({"data": data, "mime_type": "audio/pcm"})
             except Exception as e:
                 if self.config.enable_debug:
@@ -910,7 +1063,7 @@ Report results clearly and wait for next instruction."""
                 break
     
     async def _audio_sender(self):
-        """Send audio data to Gemini"""
+        """Send audio data to Gemini following Google's example approach"""
         while self._session_active:
             try:
                 # Use timeout to prevent blocking forever
@@ -919,12 +1072,62 @@ Report results clearly and wait for next instruction."""
                 )
                 
                 if self.session:
-                    if "end_of_turn" in audio_data:
-                        # Signal end of audio input
-                        await self.session.send(input="", end_of_turn=True)
-                    else:
-                        # Send audio chunk
-                        await self.session.send(input=audio_data)
+                    if "send_frame" in audio_data:
+                        # Send the captured frame at the start of recording
+                        if self._audio_frame_for_context is not None:
+                            frame_rgb = cv2.cvtColor(self._audio_frame_for_context, cv2.COLOR_BGR2RGB)
+                            img = PIL.Image.fromarray(frame_rgb)
+                            img.thumbnail([1024, 1024])
+                            
+                            # Send image using send_realtime_input
+                            await self.session.send_realtime_input(media=img)
+                            
+                            if self.config.enable_debug:
+                                print(f"[DEBUG] Sent frame at start of audio recording")
+                            
+                            # Don't clear the frame yet, we might need it
+                        
+                    elif "end_of_recording" in audio_data:
+                        # Recording finished - send silence then signal end of turn
+                        if self.config.enable_debug:
+                            print("[DEBUG] Audio recording ended, signaling end of turn")
+                        
+                        # Send a small silence buffer to help Gemini detect end of speech
+                        # Increase to 500ms for better detection
+                        silence_duration = 0.5  # 500ms of silence
+                        silence_samples = int(16000 * silence_duration)  # 16kHz sample rate
+                        silence_data = b'\x00' * (silence_samples * 2)  # 2 bytes per sample (16-bit)
+                        
+                        await self.session.send_realtime_input(
+                            audio=types.Blob(
+                                data=silence_data,
+                                mime_type="audio/pcm"
+                            )
+                        )
+                        
+                        # Small delay to ensure all audio has been transmitted
+                        await asyncio.sleep(0.1)
+                        
+                        # Clear frame buffer
+                        self._audio_frame_for_context = None
+                        
+                        # Do NOT send explicit turn completion for audio
+                        # Google's example shows that audio should rely on natural turn detection
+                        # The silence buffer we sent above is sufficient for Gemini to detect end of speech
+                        if self.config.enable_debug:
+                            print("[DEBUG] Audio recording ended, relying on silence for turn detection")
+                        
+                    elif "data" in audio_data:
+                        # Send audio chunk in real-time (following Google's approach)
+                        audio_bytes = audio_data["data"]
+                        
+                        # Send using send_realtime_input for real-time streaming
+                        await self.session.send_realtime_input(
+                            audio=types.Blob(
+                                data=audio_bytes,
+                                mime_type="audio/pcm"
+                            )
+                        )
                         
             except queue.Empty:
                 continue
@@ -932,42 +1135,99 @@ Report results clearly and wait for next instruction."""
                 if self.config.enable_debug:
                     print(f"Audio sender error: {e}")
                 await asyncio.sleep(0.1)
+    
+    async def _audio_player(self):
+        """Play audio responses from Gemini"""
+        while self._session_active:
+            try:
+                # Get audio data from queue - blocking call
+                audio_bytes = await self.audio_output_queue.get()
+                
+                if self.audio_output_stream and audio_bytes:
+                    # Audio from Gemini is 24kHz, 16-bit PCM
+                    # Write directly to output stream (following Google's example)
+                    await asyncio.to_thread(self.audio_output_stream.write, audio_bytes)
+                    
+            except Exception as e:
+                if self.config.enable_debug:
+                    print(f"[DEBUG] Audio playback error: {e}")
+                await asyncio.sleep(0.1)
         
-    async def cleanup(self):
-        """Clean up session resources"""
+    async def _cleanup_session(self):
+        """Clean up current session before reconnection"""
         try:
-            # Clean up audio
+            # Stop recording if in progress
+            self._recording = False
+            
+            # Clear audio context
+            self._audio_frame_for_context = None
+            
+            # Clear audio queues
+            while not self.audio_queue.empty():
+                try:
+                    self.audio_queue.get_nowait()
+                except:
+                    pass
+            
+            # Clear output queue if it exists (asyncio.Queue)
+            if self.audio_output_queue:
+                if hasattr(self.audio_output_queue, 'get_nowait'):
+                    while not self.audio_output_queue.empty():
+                        try:
+                            self.audio_output_queue.get_nowait()
+                        except:
+                            pass
+            
+            if self.session:
+                try:
+                    await self.session.close()
+                except:
+                    pass  # Ignore errors during cleanup
+                self.session = None
+            
+            self._session_active = False
+            
+            # Don't close vision/robot components - keep them for reconnection
+            print("[CLEANUP] Session cleaned up, audio buffers cleared, components preserved")
+            
+        except Exception as e:
+            print(f"[WARNING] Cleanup error: {e}")
+    
+    async def cleanup(self):
+        """Clean up all resources completely"""
+        try:
+            # Clean up session first
+            await self._cleanup_session()
+            
+            # Clean up audio resources
             if self.audio_stream:
                 self.audio_stream.stop_stream()
                 self.audio_stream.close()
+            if self.audio_output_stream:
+                self.audio_output_stream.stop_stream()
+                self.audio_output_stream.close()
             if self.pya:
                 self.pya.terminate()
             
-            # Cancel audio task
+            # Cancel audio tasks
             if self._audio_task:
                 self._audio_task.cancel()
+                try:
+                    await self._audio_task
+                except asyncio.CancelledError:
+                    pass
+            if self._audio_playback_task:
+                self._audio_playback_task.cancel()
+                try:
+                    await self._audio_playback_task
+                except asyncio.CancelledError:
+                    pass
 
+            # Clean up vision
             if self.vision_controller:
                 self.vision_controller.stop_display_thread()
                 self.vision_controller.stop_camera()
             
-            """Clean up current session before reconnection"""
-            try:
-                if self.session:
-                    try:
-                        await self.session.close()
-                    except:
-                        pass  # Ignore errors during cleanup
-                    self.session = None
-                
-                self._session_active = False
-                
-                # Don't close vision/robot components - keep them for reconnection
-                print("[CLEANUP] Session cleaned up, components preserved")
-                
-            except Exception as e:
-                print(f"[WARNING] Cleanup error: {e}")
-                
             print("Cleanup complete")
         except Exception as e:
             print(f"Cleanup error: {e}")
@@ -979,8 +1239,8 @@ Report results clearly and wait for next instruction."""
 class GeminiLiveApp:
     """Main application coordinating Gemini Live with robot"""
     
-    def __init__(self, mode: str = "text", input_mode: str = "text"):
-        self.config = GeminiConfig.from_mode(mode, input_mode)
+    def __init__(self, mode: str = "text", input_mode: str = "text", response_mode: str = "text"):
+        self.config = GeminiConfig.from_mode(mode, input_mode, response_mode)
         self.session_manager = GeminiLiveSession(self.config)
         self.running = False
     
@@ -989,6 +1249,7 @@ class GeminiLiveApp:
         print(f"\n{'='*60}")
         print(f"PAROL6 Gemini Live Controller")
         print(f"Mode: {self.config.mode.value.upper()}")
+        print(f"Input: {self.config.input_mode} | Response: {self.config.response_mode}")
         if self.config.mode == OperationMode.AUTONOMOUS:
             print("Compositional function calling enabled")
             print(f"Turn coverage: {self.config.turn_coverage}")
@@ -1011,14 +1272,15 @@ class GeminiLiveApp:
         """Main run loop"""
         self.running = True
         
+        # Setup audio BEFORE starting session (for input or output)
+        # This ensures audio output stream is ready when session starts
+        if self.config.input_mode == "audio" or self.config.enable_voice:
+            await self.session_manager.setup_audio()
+        
         # Start the session
         session_task = asyncio.create_task(self.session_manager.run_session())
         
         await asyncio.sleep(2)
-        
-        # Setup audio if needed
-        if self.config.input_mode == "audio":
-            await self.session_manager.setup_audio()
         
         # Start frame sending loop
         frame_task = asyncio.create_task(self._frame_loop())
@@ -1176,7 +1438,7 @@ class GeminiLiveApp:
                 await asyncio.sleep(0.1)
 
 # Additional helper to gracefully restart the entire app if needed
-async def run_with_auto_restart(mode: str = "text", input_mode: str = "text"):
+async def run_with_auto_restart(mode: str = "text", input_mode: str = "text", response_mode: str = "text"):
     """Run the app with automatic restart on fatal errors"""
     restart_attempts = 0
     max_restarts = 3
@@ -1185,7 +1447,7 @@ async def run_with_auto_restart(mode: str = "text", input_mode: str = "text"):
         try:
             print(f"\n[START] Starting Gemini Live App (attempt {restart_attempts + 1}/{max_restarts})")
             
-            app = GeminiLiveApp(mode=mode, input_mode=input_mode)
+            app = GeminiLiveApp(mode=mode, input_mode=input_mode, response_mode=response_mode)
             
             if not await app.initialize():
                 print("[ERROR] Failed to initialize")
@@ -1226,12 +1488,18 @@ async def main():
         '--input',
         choices=['text', 'audio'],
         default='text',
-        help='Input mode: text (keyboard) or audio (push-to-talk)'
+        help='Input mode: text (keyboard) or audio (push-to-talk). Default: text'
+    )
+    parser.add_argument(
+        '--response',
+        choices=['text', 'audio'],
+        default=None,  # Will be determined based on input mode
+        help='Response mode: text (terminal) or audio (voice). Default: matches input mode (audio→audio, text→text)'
     )
     parser.add_argument(
         '--ptt-key',
         default='space',
-        help='Push-to-talk key (default: space). Options: space, ctrl, shift, tab, etc.'
+        help='Push-to-talk key for audio input (default: space). Options: space, ctrl, shift, tab, etc.'
     )
     parser.add_argument(
         '--debug',
@@ -1246,9 +1514,25 @@ async def main():
     
     args = parser.parse_args()
     
+    # Implement smart defaults for response mode
+    if args.response is None:
+        # If no response mode specified, default based on input mode
+        if args.input == "audio":
+            response_mode = "audio"  # Audio input defaults to audio response
+            if args.debug:
+                print(f"[DEBUG] Auto-setting response mode to 'audio' (matches input)")
+        else:
+            response_mode = "text"   # Text input defaults to text response
+            if args.debug:
+                print(f"[DEBUG] Auto-setting response mode to 'text' (matches input)")
+    else:
+        response_mode = args.response  # Use explicit override
+        if args.debug:
+            print(f"[DEBUG] Using explicit response mode: {response_mode}")
+    
     # If auto-restart is disabled, run normally
     if args.no_restart:
-        app = GeminiLiveApp(mode=args.mode, input_mode=args.input)
+        app = GeminiLiveApp(mode=args.mode, input_mode=args.input, response_mode=response_mode)
         
         # Override settings if specified
         if args.ptt_key:
@@ -1275,7 +1559,7 @@ async def main():
             print(f"{'='*60}\n")
             
             # Create and configure app
-            app = GeminiLiveApp(mode=args.mode, input_mode=args.input)
+            app = GeminiLiveApp(mode=args.mode, input_mode=args.input, response_mode=response_mode)
             
             # Override settings if specified
             if args.ptt_key:
@@ -1329,11 +1613,22 @@ async def main():
     return 0
 
 if __name__ == "__main__":
+    # Suppress the "Warning: there are non-text parts" messages from Gemini API
+    # These are informational warnings about multi-modal responses (audio/video/text)
+    warnings.filterwarnings("ignore", message=".*non-text parts.*")
+    warnings.filterwarnings("ignore", message=".*non-data parts.*")
+    warnings.filterwarnings("ignore", message=".*non text parts.*")
+    
     # Calibrate gripper on startup (optional)
     try:
         from Headless.robot_api import control_electric_gripper
         control_electric_gripper("calibrate")
         print(" Gripper calibrated")
+
+        from supplementary_functions import move_to_standard_position
+        move_to_standard_position()
+        print(" Moved to home position")
+
     except Exception as e:
         print(f"[WARNING] Gripper calibration skipped: {e}")
     
@@ -1357,41 +1652,47 @@ if __name__ == "__main__":
 
 # Basic Configurations
 
-    # Text Mode (Step-by-Step Testing)
+    # Default Behavior
 """ 
-
-# Default - text mode with keyboard input
+# Default - text input with text responses
 python gemini.py
 
-# Explicit text mode with keyboard input
-python gemini.py --mode text --input text
+# Audio input with audio responses (default for audio)
+python gemini.py --input audio
 
-# Text mode with debug output
-python gemini.py --mode text --debug
+# Text input with text responses (explicit)
+python gemini.py --input text --response text
  """
 
-    # Autonomous Mode (Multi-Step Operations)
+    # Mixed Input/Output Modes
 """ 
-# Autonomous mode with keyboard input
+# Speak to Gemini, see text responses
+python gemini.py --input audio --response text
+
+# Type to Gemini, hear voice responses
+python gemini.py --input text --response audio
+
+# Full voice conversation (explicit)
+python gemini.py --input audio --response audio
+ """
+
+    # Autonomous Mode Examples
+""" 
+# Autonomous with text I/O
 python gemini.py --mode autonomous
 
-# Autonomous mode with keyboard input (explicit)
-python gemini.py --mode autonomous --input text
-
-# Autonomous mode with push-to-talk voice input (space key)
+# Autonomous with voice I/O (defaults to audio responses)
 python gemini.py --mode autonomous --input audio
 
-# Autonomous mode with custom push-to-talk key
+# Autonomous with voice input but text responses
+python gemini.py --mode autonomous --input audio --response text
+
+# Custom push-to-talk key
 python gemini.py --mode autonomous --input audio --ptt-key ctrl
 python gemini.py --mode autonomous --input audio --ptt-key shift
-python gemini.py --mode autonomous --input audio --ptt-key tab
-python gemini.py --mode autonomous --input audio --ptt-key alt
 
-# Autonomous mode with voice input and debug
+# With debug output
 python gemini.py --mode autonomous --input audio --debug
-
-# Autonomous mode with text input and debug
-python gemini.py --mode autonomous --input text --debug
  """
 
 # Complete Parameter Reference
@@ -1409,6 +1710,11 @@ Options:
       audio: Push-to-talk voice input
       Default: text
 
+  --response {text,audio}
+      text: Terminal text output
+      audio: Voice/speech output
+      Default: Matches input mode (audio→audio, text→text)
+
   --ptt-key KEY
       Push-to-talk key for audio input
       Options: space, ctrl, shift, alt, tab, f1-f12, etc.
@@ -1417,6 +1723,10 @@ Options:
   --debug
       Enable debug output and verbose logging
       Default: False
+
+  --no-restart
+      Disable automatic restart on connection failures
+      Default: False (auto-restart enabled)
  """
 
 # Common Use Cases
@@ -1424,13 +1734,19 @@ Options:
 # Testing individual functions
 python gemini.py --mode text
 
-# Full autonomous operation with voice
+# Full voice conversation (speak and hear responses)
 python gemini.py --mode autonomous --input audio
 
-# Debugging autonomous sequences
-python gemini.py --mode autonomous --debug
+# Voice input with text output (good for debugging)
+python gemini.py --mode autonomous --input audio --response text
 
-# Voice control with different PTT key for noisy environment
+# Text input with voice output (accessibility)
+python gemini.py --mode autonomous --response audio
+
+# Debugging with full visibility
+python gemini.py --mode autonomous --input audio --response text --debug
+
+# Voice control with different PTT key
 python gemini.py --mode autonomous --input audio --ptt-key ctrl
 
 # Development/testing with all debug info
