@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from collections import deque
 from spatialmath import SE3
 import threading
+import os
 
 from Headless.robot_api import (
     get_robot_pose, 
@@ -43,7 +44,8 @@ DEPTH_FORMAT = rs.format.z16
 COLOR_FORMAT = rs.format.bgr8
 
 # Calibration
-DEFAULT_CALIBRATION_FILE = "Headless\Vision\Results\calibration\calibration_manual_20250828_174636.npz"
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_CALIBRATION_FILE = os.path.join(_script_dir, "Results", "calibration", "calibration_manual_20250828_174636.npz")
 
 # Robot Configuration
 ROBOT_MAX_REACH_MM = 400
@@ -177,11 +179,16 @@ class VisionController:
             if abs(det - 1.0) > 0.1:
                 print(f"⚠ Warning: Transformation matrix determinant = {det:.3f}")
             
-            print(f"✓ Loaded calibration from {filepath}")
+            print(f"[OK] Loaded calibration from {filepath}")
             
             # Extract and display camera offset
             offset = self.calibration_data['T_cam2gripper'][:3, 3] * 1000
             print(f"  Camera offset: X:{offset[0]:.1f}mm, Y:{offset[1]:.1f}mm, Z:{offset[2]:.1f}mm")
+            
+            # Log if this includes manual adjustments
+            if 'calibration_manual' in filepath:
+                print(f"  NOTE: This calibration includes manual adjustments")
+                print(f"  Using calibrated Y-offset of {offset[1]:.1f}mm (no additional compensation needed)")
             
             # Store additional calibration info if available
             if 'rms_error' in data:
@@ -193,7 +200,7 @@ class VisionController:
             self._use_default_calibration()
             
         except Exception as e:
-            print(f"✗ Error loading calibration: {e}")
+            print(f"[ERROR] Error loading calibration: {e}")
             print("  Using default calibration values")
             self._use_default_calibration()
     
@@ -265,14 +272,14 @@ class VisionController:
                 if i % 10 == 0:
                     print(f"  {30-i} frames remaining...")
             
-            print("✓ Camera initialized successfully")
+            print("[OK] Camera initialized successfully")
             print(f"  Resolution: {CAMERA_WIDTH}x{CAMERA_HEIGHT} @ {CAMERA_FPS}fps")
             print(f"  FOV: H={self._calculate_fov_h():.1f}°, V={self._calculate_fov_v():.1f}°")
             
             return True
             
         except Exception as e:
-            print(f"✗ Failed to initialize camera: {e}")
+            print(f"[ERROR] Failed to initialize camera: {e}")
             return False
     
     def _calculate_fov_h(self) -> float:
@@ -287,7 +294,7 @@ class VisionController:
         """Stop camera pipeline and cleanup"""
         if self.pipeline:
             self.pipeline.stop()
-            print("✓ Camera stopped")
+            print("[OK] Camera stopped")
         
         if self.debug_mode:
             cv2.destroyWindow(DEBUG_WINDOW_NAME)
@@ -372,8 +379,24 @@ class VisionController:
         x1, x2 = max(0, x1), min(w, x2)
         y1, y2 = max(0, y1), min(h, y2)
         
-        # FIX 1: Increase ROI from 60% to 85% for better coverage of small objects
-        center_ratio = 0.85  # Was 0.6
+        # Adaptive ROI sizing based on object size
+        bbox_width = x2 - x1
+        bbox_height = y2 - y1
+        bbox_area = bbox_width * bbox_height
+        
+        # Small objects need larger ROI percentage, large objects need smaller
+        if bbox_area < 900:  # Very small object (< 30x30 pixels)
+            center_ratio = 0.95  # Use almost entire bbox
+        elif bbox_area < 2500:  # Small object (< 50x50 pixels)
+            center_ratio = 0.85  # Current default
+        elif bbox_area < 10000:  # Medium object (< 100x100 pixels)
+            center_ratio = 0.70
+        else:  # Large object
+            center_ratio = 0.60  # Use smaller ratio to avoid background
+        
+        if verbose:
+            print(f"[DEPTH] Bbox size: {bbox_width}x{bbox_height} (area={bbox_area}), ROI ratio: {center_ratio:.2f}")
+        
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         rx, ry = int((x2 - x1) * center_ratio / 2), int((y2 - y1) * center_ratio / 2)
         
@@ -457,10 +480,10 @@ class VisionController:
         confidence = (height_confidence * 0.4 + point_confidence * 0.4 + variance_confidence * 0.2)
         
         # Centroid reliability assessment
-        # More lenient criteria: need decent points and reasonable variance
-        centroid_reliable = (valid_point_ratio > 0.2 and  # At least 20% valid points
-                            object_height > 5 and          # At least 5mm height detected
-                            np.mean(centroid_variance) < 500)  # Reasonable variance
+        # Stricter criteria for better accuracy
+        centroid_reliable = (valid_point_ratio > 0.4 and  # At least 40% valid points (was 20%)
+                            object_height > 10 and         # At least 10mm height detected (was 5mm)
+                            np.mean(centroid_variance) < 200)  # Tighter variance limit (was 500)
         
         if verbose:
             print(f"[DEPTH] Confidence: {confidence:.2f} (height:{height_confidence:.2f}, points:{point_confidence:.2f}, var:{variance_confidence:.2f})")
@@ -482,15 +505,15 @@ class VisionController:
     def calculate_object_orientation_world_frame(self, world_points: np.ndarray) -> float:
         """
         Calculate object orientation using PCA on world-frame points.
-        DISABLED for small objects to prevent mis-rotation.
+        More selective for small objects to prevent mis-rotation.
         """
-        # FIX: Disable rotation for small objects (height < 30mm)
+        # Adjusted threshold: Allow rotation for 25mm cubes but be more careful
         if 'depth_stats' in locals() or hasattr(self, '_current_depth_stats'):
             # Get height from current processing context
             object_height = self._current_depth_stats.get('object_height', 0) if hasattr(self, '_current_depth_stats') else 0
             
-            if object_height < 30:
-                print(f"[ROTATION] Disabled for small object (height={object_height:.1f}mm)")
+            if object_height < 25:  # Changed from 30mm to 25mm
+                print(f"[ROTATION] Disabled for very small object (height={object_height:.1f}mm)")
                 return 0.0
         
         # Also check point count
@@ -628,13 +651,13 @@ class VisionController:
         if robot_pose is None:
             robot_pose = get_robot_pose_matrix()
             if robot_pose is None:
-                print("✗ Failed to get robot pose")
+                print("[ERROR] Failed to get robot pose")
                 return None
         
         # Extract world-frame depth statistics (includes centroid now)
         depth_stats = self.extract_depth_statistics(bbox, depth_frame, robot_pose)
         if depth_stats is None:
-            print("✗ Failed to extract depth statistics in world frame")
+            print("[ERROR] Failed to extract depth statistics in world frame")
             return None
         
         # Get the depth at center pixel for initial transformation
@@ -664,8 +687,8 @@ class VisionController:
         # Extract 3D position in mm (this is the bbox-center derived position)
         position_3d_original = point_base_h[:3] * 1000  # Convert back to mm
         
-        # FIX 2: Enhanced centroid correction with Y-offset compensation
-        if depth_stats.get('centroid_reliable', False) and depth_stats['confidence'] > 0.3:  # Lowered from 0.5
+        # Enhanced centroid correction with proper confidence threshold
+        if depth_stats.get('centroid_reliable', False) and depth_stats['confidence'] > 0.5:  # Restored to 0.5 for better reliability
             world_centroid = depth_stats['world_centroid']
             
             # Calculate correction offsets
@@ -686,29 +709,46 @@ class VisionController:
                 position_3d = position_3d_original.copy()
                 position_3d[0] += x_correction * weight
                 position_3d[1] += y_correction * weight
-                position_3d[2] = depth_stats['object_median']  # Always use median for Z
+                
+                # FIX: Use grasp-optimized Z instead of median
+                table_z = depth_stats.get('table_surface', 0)
+                object_height = depth_stats.get('object_height', 25)
+                grasp_z = table_z + min(object_height * 0.3, 15)  # Grasp at 30% height, max 15mm
+                position_3d[2] = grasp_z
                 
                 if self.debug_mode or validate_safety:  # Add verbose flag
-                    print(f"[3D] Applied centroid correction: X={x_correction*weight:.1f}mm, Y={y_correction*weight:.1f}mm (confidence={weight:.2f})")
+                    print(f"[3D] Applied centroid correction: X={x_correction*weight:.1f}mm, Y={y_correction*weight:.1f}mm (confidence={weight:.2f}")
+                    print(f"[3D] Original pos: X={position_3d_original[0]:.1f}, Y={position_3d_original[1]:.1f}, Z={position_3d_original[2]:.1f}")
+                    print(f"[3D] Corrected pos: X={position_3d[0]:.1f}, Y={position_3d[1]:.1f}, Z={position_3d[2]:.1f}")
+                    print(f"[3D] Using grasp Z={grasp_z:.1f} (table={table_z:.1f}, height={object_height:.1f})")
             else:
-                # Correction too large, fall back to original with just Z fix
+                # Correction too large, fall back to original with proper Z
                 print(f"[3D] Centroid correction too large ({correction_magnitude:.1f}mm), using fallback")
                 position_3d = position_3d_original.copy()
-                position_3d[2] = depth_stats['object_median']
+                
+                # Use grasp-optimized Z
+                table_z = depth_stats.get('table_surface', 0)
+                object_height = depth_stats.get('object_height', 25)
+                grasp_z = table_z + min(object_height * 0.3, 15)
+                position_3d[2] = grasp_z
         else:
-            # FIX 2: When centroid not reliable, apply systematic Y-offset compensation
-            # Camera is mounted 39mm behind gripper, causing systematic forward bias
-            print(f"[3D] Centroid not reliable (conf={depth_stats['confidence']:.2f}), applying Y-offset compensation")
+            # When centroid not reliable, use original position without additional compensation
+            # The calibration matrix already includes the camera-gripper offset
+            print(f"[3D] Centroid not reliable (conf={depth_stats['confidence']:.2f}), using calibrated position")
             position_3d = position_3d_original.copy()
-            position_3d[2] = depth_stats['object_median']
             
-            # Apply systematic Y-offset correction for camera mounting geometry
-            # Camera sees front edge as center, need to shift back
-            Y_OFFSET_COMPENSATION = -12.0  # mm, negative because camera is behind gripper
-            position_3d[1] += Y_OFFSET_COMPENSATION
+            # FIX: Use grasp-optimized Z instead of median
+            # Calculate Z for grasping (lower than median, closer to table)
+            table_z = depth_stats.get('table_surface', 0)
+            object_height = depth_stats.get('object_height', 25)
+            
+            # Grasp at 30% of object height from table (instead of median which is ~50%)
+            grasp_z = table_z + min(object_height * 0.3, 15)  # Max 15mm from table
+            position_3d[2] = grasp_z
             
             if self.debug_mode:
-                print(f"[3D] Applied Y-offset compensation: {Y_OFFSET_COMPENSATION}mm")
+                print(f"[3D] No additional Y-offset applied (calibration handles it)")
+                print(f"[3D] Z adjusted for grasping: median={depth_stats['object_median']:.1f} -> grasp={grasp_z:.1f}")
                 print(f"[3D] Final position: X={position_3d[0]:.1f}, Y={position_3d[1]:.1f}, Z={position_3d[2]:.1f}")
         
         # Calculate derived metrics
@@ -732,10 +772,14 @@ class VisionController:
         
         # Calculate object orientation in world frame
         object_orientation = 0.0
-        if 'world_points' in depth_stats and depth_stats['object_height'] > 30:  # Only for objects > 30mm
+        if 'world_points' in depth_stats and depth_stats['object_height'] >= 25:  # Allow for 25mm cubes
             object_orientation = self.calculate_object_orientation_world_frame(
                 depth_stats['world_points']
             )
+            # Limit rotation correction for small objects
+            if depth_stats['object_height'] < 30 and abs(object_orientation) > 30:
+                print(f"[ROTATION] Limiting rotation for small object: {object_orientation:.1f}° -> {np.sign(object_orientation) * 30:.1f}°")
+                object_orientation = np.sign(object_orientation) * 30  # Cap at ±30 degrees
         else:
             print(f"[ROTATION] Skipped: height={depth_stats.get('object_height', 0):.1f}mm")
         
@@ -957,7 +1001,7 @@ class VisionController:
         self.display_running = True
         self.display_thread = threading.Thread(target=self._display_loop, daemon=True)
         self.display_thread.start()
-        print(f"✓ Started camera preview in '{window_name}' window")
+        print(f"[OK] Started camera preview in '{window_name}' window")
 
     def _display_loop(self):
         """
@@ -1022,7 +1066,7 @@ class VisionController:
             self.display_running = False
             if hasattr(self, 'display_thread'):
                 self.display_thread.join(timeout=1.0)
-            print("✓ Stopped camera preview")
+            print("[OK] Stopped camera preview")
 
     # Also modify the stop_camera method in VisionController to include:
     def stop_camera(self):
@@ -1033,7 +1077,7 @@ class VisionController:
         
         if self.pipeline:
             self.pipeline.stop()
-            print("✓ Camera stopped")
+            print("[OK] Camera stopped")
         
         if self.debug_mode:
             cv2.destroyWindow(DEBUG_WINDOW_NAME)
