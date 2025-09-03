@@ -48,6 +48,9 @@ def search(search_pattern = "sweep", position = "low", continue_from_current_pos
         result = move_robot_joints(end_joint_angles, speed_percentage=10, wait_for_ack=True)
 
         delay_robot(1.0)
+        
+        # Return to standard position after search completion
+        move_to_standard_position()
 
         return result
     
