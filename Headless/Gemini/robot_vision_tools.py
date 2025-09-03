@@ -58,7 +58,7 @@ GRIPPER_CURRENT = 600  # mA
 # Movement speeds (percentage)
 SPEED_APPROACH = 40
 SPEED_GRASP = 20
-SPEED_LIFT = 30
+SPEED_LIFT = 50  # Increased from 30 for faster lifting
 SPEED_TRANSPORT = 50
 SPEED_RETURN = 40  # New speed for returning to detection position
 
@@ -68,7 +68,16 @@ GRASP_DEPTH_RATIOS = {
     "horizontal": 0.5   # Grasp at center
 }
 
-MIN_TABLE_CLEARANCE = 10  # Increased from 8mm
+# Adaptive clearance based on object size
+def get_adaptive_table_clearance(object_height: float) -> float:
+    """Get table clearance based on object height"""
+    if object_height < 20:
+        return 5  # 5mm for very small objects
+    elif object_height < 30:
+        return 7  # 7mm for small objects like 25mm cubes
+    else:
+        return 10  # 10mm for larger objects
+        
 MIN_OBJECT_HEIGHT_FOR_DEEP_GRASP = 12  # Reduced from 15mm
 MAX_GRASP_DEPTH_RATIO = 0.5  # Reduced from 0.6 for safety
 
@@ -95,7 +104,7 @@ class RobotVisionTools:
         self.picked_object_confidence = None
         self.picked_object_bbox = None
     
-    async def search_for_object(self, object_description: str, pattern: str = "sweep") -> Dict:
+    async def search_for_object(self, object_description: str, pattern: str = "sweep", position = "low") -> Dict:
         """
         Start searching movement to find an object
         
@@ -106,29 +115,15 @@ class RobotVisionTools:
         self.is_moving = True
         
         try:
-            if pattern == "sweep":
-                # Use existing search function
-                robot_actions.search()
-            elif pattern == "vertical":
-                # Vertical search pattern
-                move_robot_joints([90, -60, 180, 0, -30, 180], speed_percentage=30)
-                delay_robot(0.5)
-                move_robot_joints([90, -90, 220, 0, -30, 180], speed_percentage=20)
-                delay_robot(0.5)
-                move_robot_joints([90, -120, 260, 0, -30, 180], speed_percentage=20)
-            elif pattern == "spiral":
-                # Spiral search pattern
-                for angle in [0, 45, 90, 135, 180, -135, -90, -45]:
-                    jog_robot_joint(0, speed_percentage=15, distance_deg=45)
-                    delay_robot(0.3)
-            else:
-                # Default to sweep
-                robot_actions.search()
+            # Start the search movement (non-blocking - returns immediately)
+            # The search will continue in the background while Gemini watches
+            robot_actions.search(search_pattern=pattern, position=position)
             
             return {
                 "status": "searching",
                 "target": object_description,
                 "pattern": pattern,
+                "position": position,
                 "message": "Robot is moving in search pattern. Ensure that YOU, the assistant, call the stop_when_found() when you see the object. Not the user."
             }
             
@@ -352,10 +347,10 @@ class RobotVisionTools:
                 position=0,  # Fully open
                 speed=150,
                 current=500,
-                wait_for_ack=True,
+                wait_for_ack=False,
                 timeout=3.0
             )
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.3)  # Reduced from 0.5 - gripper opening
             
             # 2. Move to approach position
             approach_pos = optimal_position.copy()
@@ -383,7 +378,7 @@ class RobotVisionTools:
                 print(f"ERROR: Failed to reach approach position: {result.get('details')}")
                 return False
             
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)  # Reduced from 1.0
             
             # 3. Descend to grasp position
             grasp_pose = optimal_position + adjusted_orientation
@@ -415,7 +410,7 @@ class RobotVisionTools:
                     print(f"ERROR: Cannot reach grasp position")
                     return False
             
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)  # Reduced from 1.0
             
             # 4. Close gripper
             print("Closing gripper...")
@@ -424,10 +419,10 @@ class RobotVisionTools:
                 position=GRIPPER_CLOSE_POS,
                 speed=GRIPPER_SPEED,
                 current=GRIPPER_CURRENT,
-                wait_for_ack=True,
+                wait_for_ack=False,
                 timeout=3.0
             )
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.7)  # Reduced from 1.0
             
             # 5. Check gripper feedback
             gripper_status = get_electric_gripper_status()
@@ -444,7 +439,7 @@ class RobotVisionTools:
                         position=20,
                         speed=100,
                         current=500,
-                        wait_for_ack=True
+                        wait_for_ack=False
                     )
                     await asyncio.sleep(0.5)
                     
@@ -465,16 +460,16 @@ class RobotVisionTools:
                     )
                     
                     if not (isinstance(result, dict) and result.get('status') == 'FAILED'):
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(0.5)  # Reduced from 1.0
                         
                         control_electric_gripper(
                             action="move",
                             position=GRIPPER_CLOSE_POS,
                             speed=GRIPPER_SPEED - 20,
                             current=GRIPPER_CURRENT + 300,
-                            wait_for_ack=True
+                            wait_for_ack=False
                         )
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(0.7)  # Reduced from 1.0
             
             # 6. Lift object
             lift_pos = optimal_position.copy()
@@ -497,9 +492,14 @@ class RobotVisionTools:
                 timeout=5.0
             )
             
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.3)  # Reduced from 1.0 - just enough for stabilization
             
             print("Pick sequence completed")
+            
+            # Return to standard position after successful pick
+            print("Returning to standard position...")
+            robot_actions.move_to_standard_position()
+            
             return True
             
         except Exception as e:
@@ -643,15 +643,23 @@ class RobotVisionTools:
                 position=GRIPPER_OPEN_POS,
                 speed=100,
                 current=500,
-                wait_for_ack=True,
+                wait_for_ack=False,
                 timeout=3.0
             )
             await asyncio.sleep(0.5)
             
+            # IMPORTANT: Return to detection position BEFORE re-detection
+            if self.detection_robot_angles:
+                print("[RETRY] Returning to detection position for better view...")
+                move_robot_joints(self.detection_robot_angles, speed_percentage=SPEED_RETURN, wait_for_ack=True)
+                await asyncio.sleep(1.5)  # Give time to stabilize and settle
+            else:
+                print("[RETRY] Warning: No detection position stored")
+            
             # Increase current for retry
             adjusted_current = GRIPPER_CURRENT + 300
             
-            # Object re-detection attempt
+            # Object re-detection attempt from original viewpoint
             color_frame, depth_frame = self.vision_controller.get_frames()
             bboxes = await asyncio.to_thread(
                 get_boxes_from_pro_model,
@@ -677,7 +685,7 @@ class RobotVisionTools:
                     position=GRIPPER_CLOSE_POS,
                     speed=GRIPPER_SPEED - 20,
                     current=adjusted_current,
-                    wait_for_ack=True,
+                    wait_for_ack=False,
                     timeout=3.0
                 )
                 await asyncio.sleep(1)
@@ -693,13 +701,7 @@ class RobotVisionTools:
                         move_robot_pose(pose, speed_percentage=SPEED_LIFT)
                         await asyncio.sleep(1)
                         
-                        # Return to detection position after retry
-                        if self.detection_robot_angles:
-                            return_pose = list(self.detection_robot_angles)
-                            #return_pose[2] += 50
-                            #move_robot_pose(return_pose, speed_percentage=SPEED_RETURN, wait_for_ack=True)
-                            move_robot_joints(return_pose, speed_percentage=SPEED_RETURN, wait_for_ack=True)
-                            await asyncio.sleep(1)
+                        # Already returned to detection position before retry, no need to do it again
                         
                         self.object_in_gripper = object_description
                         return {
@@ -810,27 +812,31 @@ class RobotVisionTools:
                 self.picked_object_description = None
                 self.picked_object_bbox = None
                 
-                # Verify if requested
+                # Build result first
+                result = {
+                    "status": "success",
+                    "object": self.picked_object_description,
+                    "location": location_description,
+                    "approach": approach_angle
+                }
+                
+                # Verify if requested (this moves to verification position)
                 if verify_placement:
                     verification = await self._verify_placement(
                         place_position,
                         gripper_orientation,
                         self.picked_object_description
                     )
-                    return {
-                        "status": "success",
-                        "object": self.picked_object_description,
-                        "location": location_description,
-                        "approach": approach_angle,
-                        "verification": verification
-                    }
-                else:
-                    return {
-                        "status": "success",
-                        "object": self.picked_object_description,
-                        "location": location_description,
-                        "approach": approach_angle
-                    }
+                    result["verification"] = verification
+                
+                # NOW return to standard position ONCE, after everything is done
+                print("[PLACE] Returning to standard position...")
+                robot_actions.move_to_standard_position()
+                
+                # Small stabilization delay
+                await asyncio.sleep(0.3)
+                
+                return result
             else:
                 return {"status": "error", "message": "Place sequence failed"}
                 
@@ -867,7 +873,7 @@ class RobotVisionTools:
                 print("Failed to reach approach position")
                 return False
             
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(0.5)  # Reduced from 1.0
             
             # 2. Move to pre-release position (5mm above place position)
             PRE_RELEASE_OFFSET = 5  # mm
@@ -895,7 +901,7 @@ class RobotVisionTools:
                 position=max(0, GRIPPER_OPEN_POS),
                 speed=GRIPPER_SPEED,
                 current=300,
-                wait_for_ack=True,
+                wait_for_ack=False,
                 timeout=3.0
             )
             await asyncio.sleep(0.3)  # Wait for gripper to fully open
@@ -916,19 +922,12 @@ class RobotVisionTools:
                 )
                 await asyncio.sleep(0.3)
             
-            # 5. Retract to approach position
-            print(f"[PLACE] Retracting to Z={approach_pose[2]:.1f}")
-            
-            result = move_robot_pose(
-                pose=approach_pose,
-                speed_percentage=SPEED_LIFT,
-                wait_for_ack=True,
-                timeout=5.0
-            )
-            
-            await asyncio.sleep(1.0)
-            
+            # 5. Place sequence completed - DON'T move to standard position yet
+            # This will be handled by the caller after verification (if needed)
             print("[PLACE] Place sequence completed")
+            
+            await asyncio.sleep(0.3)  # Small delay for stability
+            
             return True
             
         except Exception as e:
@@ -993,7 +992,6 @@ class RobotVisionTools:
         
         # Maximum useful grasp depth (gripper claw length)
         MAX_GRASP_DEPTH = 35  # mm (leaving 5mm margin from 40mm claws)
-        MIN_TABLE_CLEARANCE = 10  # FIX 3: Increased from 5mm to 10mm for safety
         
         # Log current position
         print(f"[GRASP] Object at: X={position_3d[0]:.1f}, Y={position_3d[1]:.1f}, Z={position_3d[2]:.1f}")
@@ -1015,57 +1013,81 @@ class RobotVisionTools:
         print(f"[GRASP] Height={object_height:.1f}mm, Table={table_surface:.1f}mm, Top={object_top:.1f}mm")
         print(f"[GRASP] Confidence={confidence:.2f}, Valid points={valid_point_ratio*100:.1f}%")
         
-        # Calculate safe grasp depth
+        # Calculate safe grasp depth from table surface (not median)
         object_median = stats['object_median']
         
-        # FIX 3: Better handling of uncertain measurements
+        # Better handling of uncertain measurements
         if object_height < 10 or confidence < 0.3 or valid_point_ratio < 0.2:
             print(f"[GRASP] Low confidence detection, using cautious approach")
             
-            # Calculate maximum safe descent from median position
-            max_safe_descent = object_median - (table_surface + MIN_TABLE_CLEARANCE)
-            
-            if max_safe_descent < 8:
-                print(f"[GRASP] WARNING: Very close to table, only {max_safe_descent:.1f}mm clearance")
-                grasp_depth = min(8, max_safe_descent)  # FIX 3: Increased minimum from 5mm
+            # For uncertain objects, grasp at fixed height from table
+            if object_height < 10:
+                # Very small/flat object - grasp close to table
+                grasp_height = min(8, object_height * 0.4)  # 40% of height or 8mm max
             else:
-                # For uncertain objects, use conservative 50% depth
-                grasp_depth = min(object_height * 0.5, max_safe_descent, 12)
+                # Uncertain measurement - use conservative 30% of detected height
+                grasp_height = min(object_height * 0.3, 15)
             
-            position_3d[2] = object_median - grasp_depth
+            position_3d[2] = table_surface + grasp_height
+            print(f"[GRASP] Low confidence grasp at {grasp_height:.1f}mm above table")
             
         else:  # Normal objects with good measurements
-            # Calculate ideal grasp depth based on object height and approach
+            # Check if object appears rotated based on bounding box aspect ratio
+            bbox = detection.bbox_2d if hasattr(detection, 'bbox_2d') else None
+            is_rotated = False
+            
+            if bbox:
+                bbox_width = abs(bbox[2] - bbox[0])
+                bbox_height = abs(bbox[3] - bbox[1])
+                aspect_ratio = bbox_width / max(bbox_height, 1)
+                
+                # If aspect ratio is not close to 1.0, object is likely rotated
+                is_rotated = aspect_ratio < 0.7 or aspect_ratio > 1.3
+                
+                if is_rotated:
+                    print(f"[GRASP] Object appears rotated (aspect ratio: {aspect_ratio:.2f})")
+            
+            # Calculate ideal grasp height from table based on object height and approach
             if approach_angle == "vertical":
-                # For vertical approach, grasp at 40% down from top
-                ideal_grasp_depth = object_height * 0.4
+                # For vertical approach, adjust based on rotation
+                if is_rotated:
+                    ideal_grasp_ratio = 0.20  # 20% for rotated objects (deeper)
+                elif object_height < 30:
+                    ideal_grasp_ratio = 0.25  # 25% for small objects
+                else:
+                    ideal_grasp_ratio = 0.30  # 30% for normal objects
             elif approach_angle == "angled":
-                # For angled approach, grasp at 30% (less due to angle)
-                ideal_grasp_depth = object_height * 0.3
+                # For angled approach, grasp lower
+                ideal_grasp_ratio = 0.20 if is_rotated else 0.25
             else:  # horizontal
-                # For horizontal, center vertically
-                ideal_grasp_depth = object_height * 0.5
+                # For horizontal, center vertically (50%)
+                ideal_grasp_ratio = 0.5
+            
+            # Calculate grasp height from table
+            ideal_grasp_height = object_height * ideal_grasp_ratio
             
             # Apply constraints
-            ideal_grasp_depth = min(ideal_grasp_depth, MAX_GRASP_DEPTH)
+            ideal_grasp_height = min(ideal_grasp_height, MAX_GRASP_DEPTH)
+            ideal_grasp_height = max(ideal_grasp_height, 5)  # At least 5mm from table
             
-            # Calculate target Z position (going down from object median)
-            target_z = object_median - ideal_grasp_depth
+            # Calculate target Z position (height above table)
+            target_z = table_surface + ideal_grasp_height
             
-            # Ensure we don't hit the table
-            min_safe_z = table_surface + MIN_TABLE_CLEARANCE
+            # Ensure we don't go above object top
+            if target_z > object_top - 5:
+                print(f"[GRASP] WARNING: Target too high, adjusting down")
+                target_z = object_top - 5  # At least 5mm into object from top
+            
+            # Ensure minimum clearance from table using adaptive clearance
+            adaptive_clearance = get_adaptive_table_clearance(object_height)
+            min_safe_z = table_surface + adaptive_clearance
             if target_z < min_safe_z:
-                print(f"[GRASP] Adjusting to avoid table: {target_z:.1f} -> {min_safe_z:.1f}")
+                print(f"[GRASP] Adjusting to maintain table clearance ({adaptive_clearance}mm): {target_z:.1f} -> {min_safe_z:.1f}")
                 target_z = min_safe_z
-            
-            # FIX 3: Additional safety check
-            if target_z > object_top:
-                print(f"[GRASP] WARNING: Target above object top, adjusting")
-                target_z = object_top - 5  # At least 5mm into object
             
             position_3d[2] = target_z
             
-            print(f"[GRASP] Depth={ideal_grasp_depth:.1f}mm, Target Z={target_z:.1f}mm")
+            print(f"[GRASP] Height from table={ideal_grasp_height:.1f}mm ({ideal_grasp_ratio*100:.0f}%), Target Z={target_z:.1f}mm")
         
         # Handle approach-specific X/Y adjustments
         if approach_angle == "angled":
@@ -1231,12 +1253,12 @@ def initialize_robot_tools(vision_controller):
     _robot_tools = RobotVisionTools(vision_controller)
     return _robot_tools
 
-async def search_for_object(object_description: str, pattern: str = "sweep") -> Dict:
+async def search_for_object(object_description: str, pattern: str = "sweep", position: str = "low") -> Dict:
     """Global wrapper for search_for_object"""
     global _robot_tools
     if _robot_tools is None:
         return {"status": "error", "message": "Robot tools not initialized"}
-    return await _robot_tools.search_for_object(object_description, pattern)
+    return await _robot_tools.search_for_object(object_description, pattern, position)
 
 async def stop_when_found() -> Dict:
     """Global wrapper for stop_when_found"""
